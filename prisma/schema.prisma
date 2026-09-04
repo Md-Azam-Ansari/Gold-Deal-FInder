@@ -1,0 +1,276 @@
+// Gold Deal Finder — Phase 1 database schema
+// Covers: Retailer, Category, Product, ProductImage, ProductPriceSnapshot,
+// MetalRate, MetalRateSnapshot, ScrapeRun, Deal, Favorite, PriceAlert.
+// Deliberately relational (spec section 27: "Do not store everything as one huge JSON object").
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Metal {
+  GOLD
+  SILVER
+}
+
+enum ProductCategory {
+  RING
+  CHAIN
+  NECKLACE
+  BRACELET
+  BANGLE
+  EARRING
+  PENDANT
+  ANKLET
+  NOSE_PIN
+  MANGALSUTRA
+  OTHER_JEWELLERY
+  GOLD_COIN
+  GOLD_BAR
+  SILVER_COIN
+  SILVER_BAR
+}
+
+enum Gender {
+  MEN
+  WOMEN
+  UNISEX
+  KIDS
+  UNKNOWN
+}
+
+enum Availability {
+  IN_STOCK
+  OUT_OF_STOCK
+  UNKNOWN
+}
+
+enum DealClassification {
+  EXCEPTIONAL_DEAL
+  GREAT_DEAL
+  GOOD_DEAL
+  FAIR_PRICE
+  EXPENSIVE
+  VERY_EXPENSIVE
+  UNRATED // used when data quality is too low to rank confidently
+}
+
+enum ScrapeStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+enum ScrapeMode {
+  FULL
+  INCREMENTAL
+}
+
+model Retailer {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  websiteUrl  String
+  enabled     Boolean  @default(true)
+  scrapeFrequencyMinutes Int  @default(1440)
+  createdAt   DateTime @default(now())
+
+  products    Product[]
+  scrapeRuns  ScrapeRun[]
+
+  @@map("retailers")
+}
+
+model Category {
+  id   String @id @default(cuid())
+  name ProductCategory @unique
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id                  String   @id @default(cuid())
+  retailerId          String
+  retailer            Retailer @relation(fields: [retailerId], references: [id])
+  retailerProductId   String   // retailer's own SKU / product ID, used for dedup
+  productName         String
+  productUrl          String
+  categoryId          String
+  category            Category @relation(fields: [categoryId], references: [id])
+  gender              Gender   @default(UNKNOWN)
+
+  metal               Metal
+  purity              String   // e.g. "22K", "925" — raw label as parsed
+  purityPercentage    Decimal? @db.Decimal(5, 2) // e.g. 91.60
+  hallmark            String?
+
+  grossWeight         Decimal? @db.Decimal(10, 3) // grams
+  netMetalWeight       Decimal? @db.Decimal(10, 3) // grams — the field the pricing engine trusts
+  stoneWeight         Decimal? @db.Decimal(10, 3)
+
+  makingCharge         Decimal? @db.Decimal(12, 2)
+  makingChargePercentage Decimal? @db.Decimal(5, 2)
+
+  productPrice        Decimal  @db.Decimal(12, 2)
+  discount             Decimal? @db.Decimal(12, 2)
+  couponDiscount        Decimal? @db.Decimal(12, 2)
+  tax                  Decimal? @db.Decimal(12, 2)
+  shipping             Decimal? @db.Decimal(12, 2)
+  finalPrice           Decimal  @db.Decimal(12, 2)
+  currency             String   @default("INR")
+
+  availability         Availability @default(UNKNOWN)
+  isInvestmentProduct   Boolean  @default(false) // gold/silver coins & bars — kept out of jewellery rankings
+  isExcludedFromComparison Boolean @default(false) // e.g. diamond/gemstone products
+  exclusionReason       String?
+
+  weightIncomplete      Boolean  @default(false) // true when netMetalWeight is unavailable
+  dataQualityScore       Decimal? @db.Decimal(3, 2) // 0.00–1.00
+  dataQualityWarnings     String[] @default([])
+  isDemoData             Boolean  @default(false) // NEVER true for real scraped data
+
+  scrapedAt            DateTime @default(now())
+  firstSeenAt           DateTime @default(now())
+  lastSeenAt            DateTime @default(now())
+
+  images               ProductImage[]
+  priceSnapshots        ProductPriceSnapshot[]
+  deals                Deal[]
+  favorites            Favorite[]
+  priceAlerts           PriceAlert[]
+
+  @@unique([retailerId, retailerProductId])
+  @@index([metal, purity])
+  @@index([categoryId])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  imageUrl  String
+  isPrimary Boolean @default(false)
+
+  @@map("product_images")
+}
+
+// Every meaningful price/availability change creates a snapshot (spec section 9).
+model ProductPriceSnapshot {
+  id                   String   @id @default(cuid())
+  productId            String
+  product              Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  productPrice         Decimal  @db.Decimal(12, 2)
+  makingCharge          Decimal? @db.Decimal(12, 2)
+  discount              Decimal? @db.Decimal(12, 2)
+  tax                  Decimal? @db.Decimal(12, 2)
+  finalPrice            Decimal  @db.Decimal(12, 2)
+
+  effectivePricePerGram   Decimal? @db.Decimal(12, 2) // computed by the pricing engine, never the scraper
+  benchmarkRateAtSnapshot Decimal? @db.Decimal(12, 2)
+
+  availability          Availability @default(UNKNOWN)
+  recordedAt             DateTime @default(now())
+
+  @@index([productId, recordedAt])
+  @@map("product_price_snapshots")
+}
+
+model MetalRate {
+  id       String  @id @default(cuid())
+  metal    Metal
+  purity   String  // "24K","22K","18K","999","925", etc.
+
+  rate            Decimal  @db.Decimal(12, 2) // current ₹/gram
+  source          String
+  market          String?  @default("India")
+  isDemoData       Boolean  @default(false)
+  updatedAt        DateTime @updatedAt
+
+  snapshots        MetalRateSnapshot[]
+
+  @@unique([metal, purity])
+  @@map("metal_rates")
+}
+
+model MetalRateSnapshot {
+  id          String   @id @default(cuid())
+  metalRateId String
+  metalRate   MetalRate @relation(fields: [metalRateId], references: [id], onDelete: Cascade)
+
+  rate        Decimal  @db.Decimal(12, 2)
+  source      String
+  recordedAt   DateTime @default(now())
+
+  @@index([metalRateId, recordedAt])
+  @@map("metal_rate_snapshots")
+}
+
+model ScrapeRun {
+  id                String       @id @default(cuid())
+  retailerId        String
+  retailer          Retailer     @relation(fields: [retailerId], references: [id])
+
+  mode              ScrapeMode
+  status            ScrapeStatus
+  startedAt          DateTime     @default(now())
+  finishedAt          DateTime?
+  productsFound       Int          @default(0)
+  productsUpdated      Int          @default(0)
+  productsRemoved      Int          @default(0)
+  errorMessage        String?
+  durationMs          Int?
+
+  @@index([retailerId, startedAt])
+  @@map("scrape_runs")
+}
+
+// Deal classification is a derived/cached result of the pricing + deal-scoring engine —
+// recomputed whenever a product's price snapshot changes, never hand-set by a scraper.
+model Deal {
+  id                  String             @id @default(cuid())
+  productId           String
+  product             Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  classification       DealClassification
+  dealScore            Decimal            @db.Decimal(5, 2) // 0–100
+  premiumPercentage      Decimal?           @db.Decimal(6, 2)
+  benchmarkDifference     Decimal?           @db.Decimal(12, 2)
+  reasonCodes           String[]           @default([]) // e.g. ["BELOW_BENCHMARK","HISTORICAL_LOW"]
+  computedAt            DateTime           @default(now())
+
+  @@index([productId, computedAt])
+  @@map("deals")
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([productId])
+  @@map("favorites")
+}
+
+model PriceAlert {
+  id             String   @id @default(cuid())
+  productId       String?
+  product         Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  description     String   // human-readable, e.g. "Alert when this drops below ₹70,000"
+  targetPrice      Decimal? @db.Decimal(12, 2)
+  targetPricePerGram Decimal? @db.Decimal(12, 2)
+  isActive         Boolean  @default(true)
+  triggeredAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  @@map("price_alerts")
+}
